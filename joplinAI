@@ -1,0 +1,273 @@
+# adjust values based on your preference and system compatibility. 
+
+import requests
+import subprocess
+import time
+import json
+import sys
+import os
+from difflib import SequenceMatcher
+
+# === SETTINGS ===
+JOPLIN_TOKEN = "paste ur token here"
+OLLAMA_MODEL = "model_name_in_ur_directory"
+TEMP_NOTEBOOK = "Temp"
+MAX_NOTES_TO_HANDLE = 5
+FUZZY_THRESHOLD = 9
+DEBUG = True
+
+# === MODE SELECTION ===
+MODE_OF_OPERATION = 0  # 0 = ask each time, 1 = existing notes, 2 = new note only
+
+# === BOOT OLLAMA IF NOT RUNNING ===
+def ensure_ollama_running():
+    try:
+        requests.get("http://localhost:11434")
+    except:
+        print("[BOOT] Ollama not running. Launching...")
+        subprocess.Popen(["ollama", "serve"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        for _ in range(30):
+            try:
+                if requests.get("http://localhost:11434").status_code == 200:
+                    print("[WAIT] Ollama is now available ✅")
+                    return
+            except:
+                time.sleep(1)
+
+# === RUN PROMPT ON OLLAMA ===
+def run_model(prompt):
+    ensure_ollama_running()
+    url = "http://localhost:11434/api/generate"
+    payload = {"model": OLLAMA_MODEL, "prompt": prompt, "stream": True}
+    response_text = ""
+    print("[PROMPT] >>>", prompt)
+    try:
+        with requests.post(url, json=payload, stream=True) as r:
+            for line in r.iter_lines():
+                if line:
+                    try:
+                        data = json.loads(line.decode("utf-8"))
+                        token = data.get("response")
+                        if token:
+                            print(token, end="", flush=True)
+                            response_text += token
+                    except Exception as e:
+                        print(f"\n[WARN] Decode error: {e}")
+    except Exception as e:
+        print(f"\n❌ Request error: {e}")
+    print("\n[LLM] Response Complete.\n")
+    return response_text.strip()
+
+# === JOPLIN INTEGRATION ===
+def get_all_notes():
+    all_notes = []
+    page = 1
+    while True:
+        url = f"http://127.0.0.1:41184/notes?fields=id,title,body,created_time&token={JOPLIN_TOKEN}&page={page}"
+        res = requests.get(url)
+        items = res.json().get("items", [])
+        if not items:
+            break
+        all_notes.extend(items)
+        page += 1
+    return all_notes
+
+def create_note(title, body):
+    try:
+        folders = requests.get(f"http://127.0.0.1:41184/folders?token={JOPLIN_TOKEN}").json().get("items", [])
+        notebook_id = next((f['id'] for f in folders if f['title'].lower() == TEMP_NOTEBOOK.lower()), None)
+        if not notebook_id:
+            r = requests.post(f"http://127.0.0.1:41184/folders?token={JOPLIN_TOKEN}", json={"title": TEMP_NOTEBOOK})
+            notebook_id = r.json().get("id")
+        note = {"title": title.strip()[:100], "body": body, "parent_id": notebook_id}
+        requests.post(f"http://127.0.0.1:41184/notes?token={JOPLIN_TOKEN}", json=note)
+        print("✅ Note created.")
+    except Exception as e:
+        print("❌ Note creation error:", e)
+
+def update_note(note_id, new_body):
+    url = f"http://127.0.0.1:41184/notes/{note_id}?token={JOPLIN_TOKEN}"
+    requests.put(url, json={"body": new_body})
+    print("✅ Note updated.")
+
+# === PARSER ===
+def parse_query(query):
+    prompt = f"""
+<|system|>
+You are a stateless parser. Reset memory each time.
+
+<|user|>
+Analyze the following query and extract:
+
+- "mission": short command like summarize, compare, write, etc.
+- "note_count": number of notes involved (0 if no existing notes referenced)
+- "note_hints": list of note titles or topics referenced
+- "output_mode": always 'cli' unless user said 'make note', 'save', etc.
+
+Query: "{query}"
+
+Respond ONLY in JSON:
+{{
+  "mission": "...",
+  "note_count": ...,
+  "note_hints": ["..."],
+  "output_mode": "cli"
+}}
+"""
+    result = run_model(prompt)
+    if DEBUG: print("\n[DEBUG] Parsed JSON:\n", result)
+    try:
+        return json.loads(result)
+    except:
+        print("❌ JSON parsing failed.")
+        return None
+
+# === FUZZY MATCHING AND AI FALLBACK ===
+def fuzzy_score(a, b):
+    return SequenceMatcher(None, a.lower(), b.lower()).ratio()
+
+def ai_fallback_note_match(hints, titles, note_count):
+    prompt = f"""
+These are available note titles:
+{chr(10).join(titles)}
+
+From the following search hints:
+{', '.join(hints)}
+
+Find the {note_count} most relevant matching titles using a broad strategy:
+- Try keyword overlap or inclusion
+- Then typo-tolerant title similarity
+- If none found, pick titles semantically close to the hints
+
+Respond only as JSON list: ["title1", "title2", ...]
+"""
+    result = run_model(prompt)
+    try:
+        return json.loads(result)
+    except:
+        print("❌ AI fallback matching failed.")
+        return []
+
+def pick_notes(note_hints, notes, max_count):
+    title_map = {n['title']: n for n in notes}
+    scores = {}
+    for hint in note_hints:
+        for title in title_map:
+            score = fuzzy_score(hint, title)
+            if score > 0.5:
+                scores[title] = max(score, scores.get(title, 0))
+
+    sorted_titles = sorted(scores.items(), key=lambda x: x[1], reverse=True)
+    top_titles = [title for title, score in sorted_titles[:max_count] if score >= FUZZY_THRESHOLD]
+
+    if not top_titles:
+        print("[INFO] Fuzzy match too weak. Trying AI.")
+        fallback_titles = ai_fallback_note_match(note_hints, list(title_map.keys()), max_count)
+        return [title_map[t] for t in fallback_titles if t in title_map]
+
+    return [title_map[t] for t in top_titles]
+
+# === EXECUTE EXISTING MODE ===
+def execute_existing(mission, notes):
+    joined = "\n\n".join(f"Title: {n['title']}\n{n['body']}" for n in notes)
+    prompt = f"""Please begin all response with a title. (no prefixes, no extra words).  
+
+{mission}
+
+{joined}
+"""
+    result = run_model(prompt)
+
+    print("\n📝 Result:\n", result)
+
+    print("\n📥 What do you want to do with this output?")
+    print("1) Save as new note")
+    if len(notes) == 1:
+        print("2) Replace the original note")
+    print("3) Skip saving")
+    choice = input("Select (1/2/3): ").strip()
+
+    first_line = result.strip().split("\n")[0].strip()
+    if choice == "1":
+        create_note(first_line, result)
+    elif choice == "2" and len(notes) == 1:
+        update_note(notes[0]['id'], result)
+    else:
+        print("🚫 Skipping save.")
+
+# === EXECUTE NEW NOTE MODE ===
+def execute_new(query):
+    prompt = f"""Please begin all response with a title. (no prefixes, no extra words).  
+Then start the note content on the next line.
+
+{query}
+"""
+    result = run_model(prompt)
+
+    print("\n📝 Result:\n", result)
+    print("\n📥 What do you want to do with this output?")
+    print("1) Save as new note")
+    print("2) Skip saving")
+    choice = input("Select (1/2): ").strip()
+
+    lines = result.strip().split("\n")
+    if len(lines) < 2:
+        print("❌ Output format unexpected, skipping save.")
+        return
+
+    title = lines[0].strip()
+    body = "\n".join(lines[1:]).strip()
+
+    if choice == "1":
+        create_note(title, body)
+    else:
+        print("🚫 Skipping save.")
+
+# === MAIN ===
+def main():
+    print("✅ [SYSTEM ONLINE] Joplin Note Assistant Booted.")
+    ensure_ollama_running()
+
+    mode = MODE_OF_OPERATION
+    if mode == 0:
+        print("\nSelect Mode of Operation:")
+        print("1) Work with existing notes")
+        print("2) Create new note from scratch")
+        mode = input("Choose (1 or 2): ").strip()
+        if mode not in ["1", "2"]:
+            print("❌ Invalid choice. Exiting.")
+            return
+        mode = int(mode)
+
+    query = input("\n🗒️  How can I help with notetaking?\n> ").strip()
+
+    if mode == 2:
+        execute_new(query)
+        return
+
+    parsed = parse_query(query)
+    if not parsed:
+        return
+
+    note_count = parsed.get("note_count", 1)
+    note_hints = parsed.get("note_hints", [])
+    mission = parsed.get("mission", "summarize")
+
+    all_notes = get_all_notes()
+    if DEBUG:
+        print("\n[DEBUG] Notes in Joplin:")
+        for n in all_notes:
+            print(" -", n['title'])
+
+    matched_notes = pick_notes(note_hints, all_notes, note_count)
+
+    if not matched_notes:
+        print("❌ No matching notes found.")
+        return
+
+    execute_existing(mission, matched_notes)
+
+if __name__ == "__main__":
+    main()
+
+
